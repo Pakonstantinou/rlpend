@@ -8,7 +8,6 @@
 #include <iomanip>
 #include <math.h>       /* sin */
 #include <random>
-#include "Net.h"
 #ifdef GRAPHIC
 #include <robot_dart/gui/magnum/graphics.hpp>
 #endif
@@ -131,88 +130,84 @@ public:
     }
 };
 
-class Agent{
+class critic : public torch::nn::Module {
 public:
-    float gamma = 0.99;
+    torch::nn::Linear fc1, out;
+
+    critic(int inputs, int hidden_size, int n_a)
+            : fc1(register_module("fc1", torch::nn::Linear(inputs, hidden_size))),
+            //fc2(register_module("fc2", torch::nn::Linear(hidden_size, n_a))),
+              out(register_module("out", torch::nn::Linear(hidden_size, 1))) {}
+
+    torch::Tensor forward(torch::Tensor state)
+    {
+        //torch::Tensor x = torch::cat({state, action.unsqueeze(1)}, 1); //check for errors
+        torch::Tensor x = torch::relu(fc1(state));
+        x=out(x);
+
+        return {x};
+    }
+};
+
+class actor : public torch::nn::Module {
+public:
+    torch::nn::Linear fc1, out, out_logsigma;
+
+    actor(int inputs, int hidden_size, int n_a)
+            : fc1(register_module("fc1", torch::nn::Linear(inputs, hidden_size))),
+              out(register_module("out", torch::nn::Linear(hidden_size, n_a))),
+              out_logsigma(register_module("out_sigma", torch::nn::Linear(hidden_size, n_a))) {}
+
+    std::tuple<torch::Tensor, torch::Tensor> forward(torch::Tensor x)
+    {
+        x = torch::relu(fc1(x));
+        torch::Tensor mu = out(x);
+        torch::Tensor logsigma = out_logsigma(x);
+
+        return {mu, logsigma};
+    }
+};
+
+class Agent {
+public:
+    double gamma = 0.99;
     int n_outputs = 1;
-    int n_actions = 2;
-    NeuralNet actor = nullptr;
-    NeuralNet critic = nullptr;
+    int n_actions = 1;
+    int input_dims = 3;
     int layer1_size = 64;
     int layer2_size = 64;
     torch::Tensor log_probs;
-    torch::optim::Adam *actor_optimizer;
-    torch::optim::Adam *critic_optimizer;
+    torch::optim::SGD *actor_optimizer;
+    torch::optim::SGD *critic_optimizer;
+    std::shared_ptr<actor> ac = std::make_shared<actor>(input_dims, layer1_size, n_actions);
+    std::shared_ptr<critic> cr = std::make_shared<critic>(input_dims, layer1_size, n_actions);
 
-    Agent(float alpha, float beta, int input_dims){
-        this->actor = NeuralNet(input_dims, layer1_size, n_actions);
-        this->actor->to(device);
-        this->actor->to(torch::kDouble);
 
-        critic = NeuralNet(input_dims, layer1_size, 1);
-        critic->to(device);
-        critic->to(torch::kDouble);
-
+    Agent(float alpha, float beta) {
         // Optimizer
-        actor_optimizer = new torch::optim::Adam(actor->parameters(), torch::optim::AdamOptions(alpha));
-        critic_optimizer = new torch::optim::Adam(critic->parameters(), torch::optim::AdamOptions(beta));
+        ac->to(torch::kDouble);
+        cr->to(torch::kDouble);
+        this->actor_optimizer = new torch::optim::SGD(ac->parameters(), alpha);
+        this->critic_optimizer = new torch::optim::SGD(cr->parameters(), beta);
     }
 
-    torch::Tensor choose_action(torch::Tensor observation){
+    std::tuple<torch::Tensor, torch::Tensor> choose_action(torch::Tensor observation) {
+
+
         torch::Tensor logsigma;
-        //std::cout<<observation<<std::endl;
-        // torch::Tensor test = torch::full({1, 3}, /*value=*/observation);
-        //std::cout<<test<<std::endl;
-        torch::Tensor tensor = torch::ones(5);
-        torch::Tensor output = actor->forward(observation);
-//        std::cout<<output;
-//        std::cout<<output;
+        torch::Tensor mu;
+        std::tie(mu, logsigma) = ac->forward(observation);
+        observation=observation.detach();
+        torch::Tensor sigma = torch::exp(logsigma);
 
+        auto sample = torch::randn({1}, torch::kDouble) * sigma + mu;
 
-        torch::Tensor mu = output[0].to(torch::kDouble);
-        logsigma = output[1].to(torch::kDouble); //add exp of sigma
-        //std::cout<<mu<<logsigma<<std::endl;
-        torch::Tensor sigma = torch::exp(logsigma).to(torch::kDouble);;
-        //std::cout<<logsigma<<sigma<<std::endl;
-
-        //std::normal_distribution<float> distribution(mu.item<float>(), sigma.item<float>());
-
-        // auto sampler1 = torch::randn({1}) * sigma + mu ;
-        // auto pdf = (1.0 / (sigma * std::sqrt(2.0 * M_PI))) * torch::exp(-0.5 * torch::pow((sampler1 - mu) / sigma, 2));
-        // this->log_probs = torch::log(pdf);
-        auto sample = torch::randn({1},torch::kDouble)*sigma + mu;
-
-        // float action = tanh(sampler1.item<float>());
-        auto pdf = (1.0 / (sigma * std::sqrt(2*M_PI))) * torch::exp(-0.5 * torch::pow((sample.detach() - mu) / sigma, 2));
-        //auto probs = distribution(generator);
-        //std::cout<<"pdf"<<pdf<<std::endl;
+        auto pdf = (1.0 / (sigma * std::sqrt(2 * M_PI))) * torch::exp(-0.5 * torch::pow((sample.detach() - mu) / sigma, 2));
         this->log_probs = torch::log(pdf);
-        //this->log_probs = torch::log(torch::tensor(probs));
-        //std::cout<<probs<<log_probs<<std::endl;
-
         torch::Tensor action = torch::tanh(sample);
 
-        return action * 5;
-    }
-
-    void learn(torch::Tensor state, double reward, torch::Tensor new_state, bool done){
-        this->actor_optimizer->zero_grad();
-        this->critic_optimizer->zero_grad();
-
-        torch::Tensor critic_value_ = this->critic->forward(new_state);
-        torch::Tensor critic_value = this->critic->forward(state);
-
-        torch::Tensor tensor_reward = torch::tensor(reward);
-        torch::Tensor delta = tensor_reward + this->gamma*critic_value_ * (1 * int(!done)) - critic_value;
-
-        auto actor_loss = -1 * this->log_probs * delta;
-        auto critic_loss = torch::pow(delta, 2);
-        //std::cout<<log_probs<<std::endl<<delta<<std::endl;
-
-        (actor_loss + critic_loss).backward();
-        this->actor_optimizer->step();
-        this->critic_optimizer->step();
-    }
+        return {action * 5, log_probs};
+    };
 };
 
 int main() {
@@ -229,7 +224,7 @@ int main() {
 
     pendulum env;
 
-    Agent *agent = new Agent(0.000005, 0.00001, 3);
+    Agent *agent = new Agent(0.0001, 0.001);
 
     int num_episodes = 800000;
     bool done;
@@ -246,18 +241,38 @@ int main() {
         done = false;
         score = 0;
         torch::Tensor observation = env.reset();
+        double I=1;
 
         while (!done){
-            torch::Tensor action = agent->choose_action(observation);
+            torch::Tensor action;
+            torch::Tensor log_probs;
+
+            std::tie(action, log_probs)  = agent->choose_action(observation);
             torch::Tensor observation_;
             std::tie(observation_, reward, done) = env.step(action);
-            agent->learn(observation, reward, observation_, done);
-            observation = observation_;
             score += reward;
+            torch::Tensor currentstateval = agent->cr->forward(observation);
+            torch::Tensor newstateval = agent->cr->forward(observation_);
+
+            torch::Tensor val_loss = torch::nn::functional::mse_loss(reward + agent->gamma * newstateval, currentstateval);
+            val_loss *= I;
+            auto advantage = reward + agent->gamma * newstateval - currentstateval;
+            auto actor_loss = -log_probs * advantage;
+            actor_loss =actor_loss * I;
+            agent->actor_optimizer->zero_grad();
+            actor_loss.backward({},c10::optional<bool>(true));
+            agent->actor_optimizer->step();
+
+            agent->critic_optimizer->zero_grad();
+            val_loss.backward();
+            agent->critic_optimizer->step();
+
+            observation = observation_;
+            I = I * agent->gamma;
         }
 
         printf("Episode %d score %.2f\n", i, score);
     }
 
     return 0;
-}
+};
